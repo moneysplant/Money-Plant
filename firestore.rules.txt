@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    function settingsExists() { return exists(/databases/$(database)/documents/settings/global); }
+    function settingsDoc() { return get(/databases/$(database)/documents/settings/global).data; }
+    function welcomeBonusVal() { return settingsExists() ? settingsDoc().welcomeBonus : 50; }
+
+    // Global app settings. Everyone signed in can read (needed to show
+    // prices/support in the app). Only an admin account can change them.
+    match /settings/global {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Each user's own profile + wallet + task/check-in progress + locked payout number.
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.wallet == welcomeBonusVal()
+        && request.resource.data.tier == 'free'
+        && request.resource.data.role == 'user'
+        && request.resource.data.tasksToday == 0
+        && request.resource.data.lastCheckinDate == ''
+        && request.resource.data.paymentNumberLocked == false;
+
+      // Admin can update anything (approve requests, adjust wallets, fix a user's
+      // payout number, promote another admin, etc). A normal user may ONLY do
+      // ONE of the following to their own doc in a single write:
+      //   A) a harmless profile edit (name, withdrawal password hash) — no money,
+      //      task count, check-in date, tier, role, or payout-number fields change
+      //   B) complete exactly one valid task today (free-tier or paid-tier rate,
+      //      validated against current settings and the daily limit)
+      //   C) claim the daily check-in bonus once (wallet + settings.checkinBonus)
+      //   D) set their bKash/Nagad/Rocket/Upay payout number ONE TIME ONLY —
+      //      once paymentNumberLocked is true, only an admin can change it
+      allow update: if isAdmin() || (
+        isOwner(uid) &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.tier == resource.data.tier &&
+        request.resource.data.referrals == resource.data.referrals &&
+        request.resource.data.referralEarn == resource.data.referralEarn &&
+        (
+          // A) harmless profile edit — nothing financial or locked changes
+          (
+            request.resource.data.wallet == resource.data.wallet &&
+            request.resource.data.tasksToday == resource.data.tasksToday &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate &&
+            request.resource.data.paymentNumber == resource.data.paymentNumber &&
+            request.resource.data.paymentMethod == resource.data.paymentMethod &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked
+          )
+          ||
+          // B1) free-tier task
+          (
+            resource.data.tier == 'free' &&
+            resource.data.tasksToday < settingsDoc().freeTier.dailyLimit &&
+            request.resource.data.tasksToday == resource.data.tasksToday + 1 &&
+            request.resource.data.wallet == resource.data.wallet + settingsDoc().freeTier.rate &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked
+          )
+          ||
+          // B2) paid-tier task
+          (
+            resource.data.tier != 'free' &&
+            resource.data.tasksToday < settingsDoc().dailyTaskLimit &&
+            request.resource.data.tasksToday == resource.data.tasksToday + 1 &&
+            request.resource.data.wallet ==
+              resource.data.wallet + settingsDoc().tiers[resource.data.tier].rate &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked
+          )
+          ||
+          // C) daily check-in bonus
+          (
+            request.resource.data.lastCheckinDate != resource.data.lastCheckinDate &&
+            request.resource.data.wallet == resource.data.wallet + settingsDoc().checkinBonus &&
+            request.resource.data.tasksToday == resource.data.tasksToday &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked
+          )
+          ||
+          // D) one-time payout number lock
+          (
+            resource.data.paymentNumberLocked == false &&
+            request.resource.data.paymentNumberLocked == true &&
+            request.resource.data.paymentNumber is string &&
+            request.resource.data.paymentNumber.size() > 0 &&
+            request.resource.data.wallet == resource.data.wallet &&
+            request.resource.data.tasksToday == resource.data.tasksToday &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate
+          )
+        )
+      );
+    }
+
+    // Subscription purchase requests (manual bKash/Nagad/Rocket/Upay + Transaction ID).
+    match /subscriptionRequests/{id} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // Withdrawal requests. Time-window + withdrawal-password checks happen in
+    // the app UI (Firestore rules can't read "current hour" or verify a hash
+    // comparison meaningfully without Cloud Functions) — admin should still
+    // glance at the request time before approving.
+    match /withdrawals/{id} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+  }
+}
