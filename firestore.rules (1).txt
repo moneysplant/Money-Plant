@@ -1,0 +1,153 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    function settingsExists() { return exists(/databases/$(database)/documents/settings/global); }
+    function settingsDoc() { return get(/databases/$(database)/documents/settings/global).data; }
+    function welcomeBonusVal() { return settingsExists() ? settingsDoc().welcomeBonus : 50; }
+
+    // Global app settings (prices, bonuses, notice, banner, support links, etc).
+    // Everyone signed in can read. Only an admin can change them.
+    match /settings/global {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Payment-number ROTATION POINTERS only (just an index 0-4 per method —
+    // never the actual numbers, those live in settings/global and are
+    // admin-only). Any signed-in user may advance the pointer when they open
+    // the pay-in modal — there's no financial data here, so this is safe to
+    // leave open, and it's what makes the "next number each time" rotation
+    // work without needing a server function.
+    match /settings/paymentRotation {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() &&
+        request.resource.data.keys().hasOnly(['bKash','Nagad','Rocket','Upay']) &&
+        request.resource.data.bKash is int  && request.resource.data.bKash  >= 0 && request.resource.data.bKash  < 5 &&
+        request.resource.data.Nagad is int  && request.resource.data.Nagad  >= 0 && request.resource.data.Nagad  < 5 &&
+        request.resource.data.Rocket is int && request.resource.data.Rocket >= 0 && request.resource.data.Rocket < 5 &&
+        request.resource.data.Upay is int   && request.resource.data.Upay   >= 0 && request.resource.data.Upay   < 5;
+    }
+
+    // Admin-defined tasks (per tier). Everyone signed in can read (to see
+    // their tier's task list). Only admin can create/edit/delete.
+    match /tasks/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Each user's own profile + wallet + submission/check-in counters + locked payout number.
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.wallet == welcomeBonusVal()
+        && request.resource.data.tier == 'free'
+        && request.resource.data.role == 'user'
+        && request.resource.data.tasksToday == 0
+        && request.resource.data.lastCheckinDate == ''
+        && request.resource.data.paymentNumberLocked == false;
+
+      // Admin can update anything (approve requests, adjust wallets, credit
+      // task rewards, fix a user's payout number, promote another admin...).
+      // A normal user may ONLY do ONE of the following to their own doc:
+      //   A) a harmless profile edit — no money, submission count, check-in
+      //      date, tier, role, or payout-number fields change
+      //   B) claim the daily check-in bonus once (wallet + settings.checkinBonus)
+      //   C) submit a task for review ONCE for the day — this only advances
+      //      the daily submission counter, it never touches the wallet
+      //      directly; the wallet is only credited later by an admin when
+      //      they approve the specific task submission
+      //   D) set their bKash/Nagad/Rocket/Upay payout number ONE TIME ONLY —
+      //      once paymentNumberLocked is true, only an admin can change it
+      allow update: if isAdmin() || (
+        isOwner(uid) &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.tier == resource.data.tier &&
+        request.resource.data.referrals == resource.data.referrals &&
+        request.resource.data.referralEarn == resource.data.referralEarn &&
+        (
+          // A) harmless profile edit
+          (
+            request.resource.data.wallet == resource.data.wallet &&
+            request.resource.data.tasksToday == resource.data.tasksToday &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate &&
+            request.resource.data.paymentNumber == resource.data.paymentNumber &&
+            request.resource.data.paymentMethod == resource.data.paymentMethod &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked
+          )
+          ||
+          // B) daily check-in bonus
+          (
+            request.resource.data.lastCheckinDate != resource.data.lastCheckinDate &&
+            request.resource.data.wallet == resource.data.wallet + settingsDoc().checkinBonus &&
+            request.resource.data.tasksToday == resource.data.tasksToday &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked
+          )
+          ||
+          // C) one task submission today (no wallet change here)
+          (
+            request.resource.data.wallet == resource.data.wallet &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate &&
+            request.resource.data.paymentNumberLocked == resource.data.paymentNumberLocked &&
+            request.resource.data.tasksToday == resource.data.tasksToday + 1 &&
+            resource.data.tasksToday < (
+              resource.data.tier == 'free' ? settingsDoc().freeTier.dailyLimit : settingsDoc().dailyTaskLimit
+            )
+          )
+          ||
+          // D) one-time payout number lock
+          (
+            resource.data.paymentNumberLocked == false &&
+            request.resource.data.paymentNumberLocked == true &&
+            request.resource.data.paymentNumber is string &&
+            request.resource.data.paymentNumber.size() > 0 &&
+            request.resource.data.wallet == resource.data.wallet &&
+            request.resource.data.tasksToday == resource.data.tasksToday &&
+            request.resource.data.lastCheckinDate == resource.data.lastCheckinDate
+          )
+        )
+      );
+    }
+
+    // Task submissions (user marks a task done and submits for review).
+    // User can create their own pending submission and read their own.
+    // Only admin can approve/reject (which also credits the wallet, done
+    // in the same admin batch write from the client).
+    match /taskSubmissions/{id} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // Subscription purchase requests (manual bKash/Nagad/Rocket/Upay + Transaction ID).
+    match /subscriptionRequests/{id} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // Withdrawal requests.
+    match /withdrawals/{id} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+  }
+}
